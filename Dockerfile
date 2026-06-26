@@ -2,19 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Системные зависимости для Playwright
+# Системные зависимости (без ttf- пакетов, их заменили на fonts-)
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
-    && rm -rf /var/lib/apt/lists/*
-
-# Зависимости Playwright
-RUN apt-get update && apt-get install -y \
     libnss3 \
     libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
+    libatk1.0-0t64 \
+    libatk-bridge2.0-0t64 \
+    libcups2t64 \
     libdrm2 \
     libdbus-1-3 \
     libxkbcommon0 \
@@ -25,16 +21,18 @@ RUN apt-get update && apt-get install -y \
     libgbm1 \
     libpango-1.0-0 \
     libcairo2 \
-    libasound2 \
+    libasound2t64 \
+    fonts-unifont \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 # Python-зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Установка Chromium
+# Установка Chromium (только браузер, deps уже установлены выше)
 RUN playwright install chromium
-RUN playwright install-deps chromium
+# Не вызываем install-deps — они уже стоят
 
 # Код
 COPY . .
