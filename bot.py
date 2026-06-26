@@ -4,7 +4,8 @@ from datetime import datetime
 from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import sqlite3
 
 # ==================== КОНФИГ ====================
@@ -167,8 +168,9 @@ async def parse_reports():
             await browser.close()
 
 
-# ==================== УВЕДОМЛЕНИЯ ====================
+# ==================== УВЕДОМЛЕНИЯ ПОДПИСЧИКАМ ====================
 async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая проверка: парсит и шлёт ТОЛЬКО новые отчёты подписчикам"""
     conn = init_db()
     
     try:
@@ -191,13 +193,20 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
             message = f"🔥 <b>Новые отчёты ({len(new_reports)}):</b>\n\n"
             
             for i, report in enumerate(new_reports, start=1):
-                link = f"{BASE_URL}/view/{report['file_id']}"
                 message += (
                     f"{i}. <b>{report['period']}</b>\n"
                     f"   📄 {report['doc_type']}\n"
-                    f"   📅 Опубликован: {report['publish']}\n"
-                    f"   🔗 <a href='{link}'>Открыть отчёт</a>\n\n"
+                    f"   📅 {report['publish']}\n\n"
                 )
+            
+            keyboard = []
+            for i, report in enumerate(new_reports[:10], start=1):
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"Открыть: {report['period']}",
+                        callback_data=f"open_{report['file_id']}"
+                    )
+                ])
             
             subscribers = get_subscribers(conn)
             sent_count = 0
@@ -208,7 +217,7 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
                         chat_id=chat_id,
                         text=message,
                         parse_mode="HTML",
-                        disable_web_page_preview=True
+                        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
                     )
                     sent_count += 1
                 except Exception as e:
@@ -229,66 +238,80 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
 # ==================== КОМАНДЫ БОТА ====================
 async def start_command(update, context):
     await update.message.reply_text(
-        "👋 Привет! Я бот-парсер бухгалтерских отчётов.\n\n"
-        "📖 <b>Команды:</b>\n"
-        "/list — показать все отчёты\n"
-        "/find <год> — найти отчёты за год\n"
-        "/check — проверить прямо сейчас\n"
+        "👋 Привет! Я парсер бухгалтерских отчётов.\n\n"
+        "/check — посмотреть что есть сейчас\n"
         "/subscribe — подписаться на уведомления\n"
-        "/unsubscribe — отписаться\n"
-        "/stats — статистика\n"
-        "/help — помощь\n\n"
-        "🔔 Чтобы получать уведомления — /subscribe",
-        parse_mode="HTML"
+        "/unsubscribe — отписаться"
     )
 
 
-async def list_command(update, context):
-    conn = init_db()
+async def check_command(update, context):
+    """Показывает все отчёты с сайта"""
+    msg = await update.message.reply_text("🔍 Проверяю сайт...")
     
+    reports = await parse_reports()
+    
+    if not reports:
+        await msg.edit_text("❌ Не удалось загрузить отчёты.")
+        return
+    
+    conn = init_db()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT period, doc_type, publish_date, file_id FROM reports ORDER BY first_seen DESC"
+        known_ids = get_known_ids(conn)
+        new_reports = [r for r in reports if r['file_id'] not in known_ids]
+        
+        all_file_ids = {r['file_id'] for r in reports}
+        update_last_seen(conn, all_file_ids)
+        
+        if new_reports:
+            save_new_reports(conn, new_reports)
+        
+        # Показываем все отчёты, новые помечаем звёздочкой
+        message = f"📚 <b>Всего отчётов: {len(reports)}</b>\n\n"
+        
+        keyboard = []
+        for i, report in enumerate(reports, start=1):
+            is_new = "⭐ " if report['file_id'] not in known_ids else ""
+            message += (
+                f"{is_new}{i}. <b>{report['period']}</b>\n"
+                f"   📄 {report['doc_type']}\n"
+                f"   📅 {report['publish']}\n\n"
+            )
+            
+            if i <= 10:  # максимум 10 кнопок
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{'🆕 ' if report['file_id'] not in known_ids else ''}{report['period']}",
+                        callback_data=f"open_{report['file_id']}"
+                    )
+                ])
+        
+        if new_reports:
+            message = f"🔥 Новых: {len(new_reports)}\n\n" + message
+        
+        await msg.delete()
+        await update.message.reply_text(
+            message,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
         )
-        all_reports = cursor.fetchall()
-        
-        if not all_reports:
-            await update.message.reply_text("📭 В базе пока нет отчётов.")
-            return
-        
-        page = 0
-        if context.args:
-            try:
-                page = int(context.args[0]) - 1
-            except ValueError:
-                pass
-        
-        per_page = 10
-        total_pages = (len(all_reports) + per_page - 1) // per_page
-        start = page * per_page
-        end = start + per_page
-        reports = all_reports[start:end]
-        
-        message = f"📚 <b>Всего отчётов: {len(all_reports)}</b> (стр. {page + 1}/{total_pages})\n\n"
-        
-        for i, (period, doc_type, publish_date, file_id) in enumerate(reports, start=start + 1):
-            link = f"{BASE_URL}/view/{file_id}"
-            message += f"{i}. <b>{period}</b> | {doc_type}\n   📅 {publish_date} | <a href='{link}'>Открыть</a>\n"
-        
-        if total_pages > 1:
-            message += f"\n/list {page + 2} — следующая страница"
-        
-        await update.message.reply_text(message, parse_mode="HTML", disable_web_page_preview=True)
         
     finally:
         conn.close()
 
 
-async def check_command(update, context):
-    msg = await update.message.reply_text("🔍 Проверяю...")
-    await check_and_notify(context)
-    await msg.edit_text("✅ Готово! Новые отчёты уже отправлены подписчикам.")
+async def button_callback(update, context):
+    """Обработчик кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith("open_"):
+        file_id = query.data.replace("open_", "")
+        link = f"{BASE_URL}/view/{file_id}"
+        await query.message.reply_text(
+            f"🔗 <a href='{link}'>Открыть отчёт</a>",
+            parse_mode="HTML"
+        )
 
 
 async def subscribe_command(update, context):
@@ -298,7 +321,7 @@ async def subscribe_command(update, context):
     conn = init_db()
     try:
         subscribe_user(conn, chat_id, username)
-        await update.message.reply_text("✅ Подписан! Буду присылать новые отчёты.\nОтписаться: /unsubscribe")
+        await update.message.reply_text("✅ Подписан! Новые отчёты будут приходить автоматически.\n/unsubscribe — отписаться")
     finally:
         conn.close()
 
@@ -309,94 +332,9 @@ async def unsubscribe_command(update, context):
     conn = init_db()
     try:
         unsubscribe_user(conn, chat_id)
-        await update.message.reply_text("❌ Отписан.\nПодписаться снова: /subscribe")
+        await update.message.reply_text("❌ Отписан.\n/subscribe — подписаться снова")
     finally:
         conn.close()
-
-
-async def find_command(update, context):
-    if not context.args:
-        await update.message.reply_text("Укажи год. Пример: /find 2024")
-        return
-    
-    year = context.args[0]
-    conn = init_db()
-    
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT period, doc_type, publish_date, file_id FROM reports WHERE period LIKE ? ORDER BY first_seen DESC",
-            (f"%{year}%",)
-        )
-        reports = cursor.fetchall()
-        
-        if not reports:
-            await update.message.reply_text(f"📭 Нет отчётов за {year} год.")
-            return
-        
-        message = f"📚 <b>Отчёты за {year} год: {len(reports)}</b>\n\n"
-        
-        for i, (period, doc_type, publish_date, file_id) in enumerate(reports, start=1):
-            link = f"{BASE_URL}/view/{file_id}"
-            message += f"{i}. <b>{period}</b> | {doc_type}\n   📅 {publish_date} | <a href='{link}'>Открыть</a>\n"
-        
-        await update.message.reply_text(message, parse_mode="HTML", disable_web_page_preview=True)
-        
-    finally:
-        conn.close()
-
-
-async def stats_command(update, context):
-    conn = init_db()
-    
-    try:
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT COUNT(*) FROM reports")
-        total_reports = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT MIN(first_seen), MAX(first_seen) FROM reports")
-        oldest, newest = cursor.fetchone()
-        
-        cursor.execute(
-            "SELECT SUBSTR(period, 1, 4) as year, COUNT(*) FROM reports GROUP BY year ORDER BY year DESC"
-        )
-        by_year = cursor.fetchall()
-        
-        cursor.execute("SELECT COUNT(*) FROM subscribers")
-        total_subscribers = cursor.fetchone()[0]
-        
-        message = (
-            f"📊 <b>Статистика:</b>\n\n"
-            f"📄 Всего отчётов: <b>{total_reports}</b>\n"
-            f"👥 Подписчиков: <b>{total_subscribers}</b>\n"
-            f"📅 Первый отчёт: {oldest}\n"
-            f"📅 Последний: {newest}\n\n"
-            f"<b>По годам:</b>\n"
-        )
-        
-        for year, count in by_year:
-            message += f"• {year}: {count}\n"
-        
-        await update.message.reply_text(message, parse_mode="HTML")
-        
-    finally:
-        conn.close()
-
-
-async def help_command(update, context):
-    await update.message.reply_text(
-        "📖 <b>Все команды:</b>\n\n"
-        "/start — приветствие\n"
-        "/list [страница] — все отчёты\n"
-        "/find <год> — поиск по году\n"
-        "/check — проверить сейчас\n"
-        "/subscribe — подписаться\n"
-        "/unsubscribe — отписаться\n"
-        "/stats — статистика\n"
-        "/help — это сообщение",
-        parse_mode="HTML"
-    )
 
 
 # ==================== ЗАПУСК ====================
@@ -419,15 +357,11 @@ async def main():
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("subscribe", subscribe_command))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
-    application.add_handler(CommandHandler("find", find_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(button_callback))
     
-    # Веб-сервер для Railway
     from aiohttp import web
     
     async def health_check(request):
@@ -442,7 +376,6 @@ async def main():
     await site.start()
     print(f"Health-check на порту {PORT}")
     
-    # ===== ФИКС: вместо run_polling() =====
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
