@@ -14,14 +14,13 @@ DB_FILE = "reports.db"
 CHECK_INTERVAL = 3600  # 1 час
 
 TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", 8000))
+PORT = int(os.getenv("PORT", 8080))
 
 # ==================== БАЗА ДАННЫХ ====================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Таблица отчётов
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS reports (
             file_id TEXT PRIMARY KEY,
@@ -35,7 +34,6 @@ def init_db():
         )
     """)
     
-    # Таблица подписчиков
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS subscribers (
             chat_id TEXT PRIMARY KEY,
@@ -86,14 +84,12 @@ def update_last_seen(conn, file_ids):
 
 
 def get_subscribers(conn):
-    """Возвращает список chat_id подписчиков"""
     cursor = conn.cursor()
     cursor.execute("SELECT chat_id FROM subscribers")
     return [row[0] for row in cursor.fetchall()]
 
 
 def subscribe_user(conn, chat_id, username):
-    """Подписывает пользователя на уведомления"""
     cursor = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute("""
@@ -104,7 +100,6 @@ def subscribe_user(conn, chat_id, username):
 
 
 def unsubscribe_user(conn, chat_id):
-    """Отписывает пользователя"""
     cursor = conn.cursor()
     cursor.execute("DELETE FROM subscribers WHERE chat_id = ?", (str(chat_id),))
     conn.commit()
@@ -112,7 +107,6 @@ def unsubscribe_user(conn, chat_id):
 
 # ==================== ПАРСЕР ====================
 async def parse_reports():
-    """Парсит отчёты"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
@@ -173,9 +167,8 @@ async def parse_reports():
             await browser.close()
 
 
-# ==================== УВЕДОМЛЕНИЯ ВСЕМ ПОДПИСЧИКАМ ====================
+# ==================== УВЕДОМЛЕНИЯ ====================
 async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
-    """Фоновая задача: проверяет отчёты и уведомляет всех подписчиков"""
     conn = init_db()
     
     try:
@@ -189,14 +182,12 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
         known_ids = get_known_ids(conn)
         new_reports = [r for r in reports if r['file_id'] not in known_ids]
         
-        # Обновляем last_seen
         all_file_ids = {r['file_id'] for r in reports}
         update_last_seen(conn, all_file_ids)
         
         if new_reports:
             save_new_reports(conn, new_reports)
             
-            # Формируем сообщение
             message = f"🔥 <b>Новые отчёты ({len(new_reports)}):</b>\n\n"
             
             for i, report in enumerate(new_reports, start=1):
@@ -208,7 +199,6 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
                     f"   🔗 <a href='{link}'>Открыть отчёт</a>\n\n"
                 )
             
-            # Отправляем всем подписчикам
             subscribers = get_subscribers(conn)
             sent_count = 0
             
@@ -222,12 +212,11 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
                     )
                     sent_count += 1
                 except Exception as e:
-                    print(f"Не удалось отправить пользователю {chat_id}: {e}")
-                    # Если пользователь заблокировал бота — удаляем из подписчиков
+                    print(f"Не удалось отправить {chat_id}: {e}")
                     if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
                         unsubscribe_user(conn, chat_id)
             
-            print(f"Отправлено уведомлений: {sent_count}/{len(subscribers)}")
+            print(f"Уведомлений отправлено: {sent_count}/{len(subscribers)}")
         else:
             print("Новых отчётов нет")
             
@@ -239,24 +228,22 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== КОМАНДЫ БОТА ====================
 async def start_command(update, context):
-    """Команда /start"""
     await update.message.reply_text(
         "👋 Привет! Я бот-парсер бухгалтерских отчётов.\n\n"
         "📖 <b>Команды:</b>\n"
         "/list — показать все отчёты\n"
-        "/find &lt;год&gt; — найти отчёты за год\n"
+        "/find <год> — найти отчёты за год\n"
         "/check — проверить прямо сейчас\n"
         "/subscribe — подписаться на уведомления\n"
         "/unsubscribe — отписаться\n"
         "/stats — статистика\n"
         "/help — помощь\n\n"
-        "🔔 Чтобы получать уведомления о новых отчётах — введи /subscribe",
+        "🔔 Чтобы получать уведомления — /subscribe",
         parse_mode="HTML"
     )
 
 
 async def list_command(update, context):
-    """Показывает все отчёты (пагинация по 10 штук)"""
     conn = init_db()
     
     try:
@@ -267,10 +254,9 @@ async def list_command(update, context):
         all_reports = cursor.fetchall()
         
         if not all_reports:
-            await update.message.reply_text("📭 В базе пока нет отчётов. Ждём первой проверки...")
+            await update.message.reply_text("📭 В базе пока нет отчётов.")
             return
         
-        # Пагинация: показываем по 10 отчётов
         page = 0
         if context.args:
             try:
@@ -293,57 +279,42 @@ async def list_command(update, context):
         if total_pages > 1:
             message += f"\n/list {page + 2} — следующая страница"
         
-        await update.message.reply_text(
-            message,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+        await update.message.reply_text(message, parse_mode="HTML", disable_web_page_preview=True)
         
     finally:
         conn.close()
 
 
 async def check_command(update, context):
-    """Принудительная проверка"""
-    msg = await update.message.reply_text("🔍 Запускаю проверку...")
+    msg = await update.message.reply_text("🔍 Проверяю...")
     await check_and_notify(context)
-    await msg.edit_text("✅ Проверка завершена! Если были новые отчёты — уведомления уже отправлены.")
+    await msg.edit_text("✅ Готово! Новые отчёты уже отправлены подписчикам.")
 
 
 async def subscribe_command(update, context):
-    """Подписка на уведомления"""
     chat_id = update.effective_chat.id
     username = update.effective_user.username or update.effective_user.first_name
     
     conn = init_db()
     try:
         subscribe_user(conn, chat_id, username)
-        await update.message.reply_text(
-            "✅ Ты подписан на уведомления о новых отчётах!\n"
-            "Я буду присылать их автоматически каждый час.\n\n"
-            "Отписаться: /unsubscribe"
-        )
+        await update.message.reply_text("✅ Подписан! Буду присылать новые отчёты.\nОтписаться: /unsubscribe")
     finally:
         conn.close()
 
 
 async def unsubscribe_command(update, context):
-    """Отписка от уведомлений"""
     chat_id = update.effective_chat.id
     
     conn = init_db()
     try:
         unsubscribe_user(conn, chat_id)
-        await update.message.reply_text(
-            "❌ Ты отписан от уведомлений.\n"
-            "Подписаться снова: /subscribe"
-        )
+        await update.message.reply_text("❌ Отписан.\nПодписаться снова: /subscribe")
     finally:
         conn.close()
 
 
 async def find_command(update, context):
-    """Поиск по году"""
     if not context.args:
         await update.message.reply_text("Укажи год. Пример: /find 2024")
         return
@@ -369,24 +340,18 @@ async def find_command(update, context):
             link = f"{BASE_URL}/view/{file_id}"
             message += f"{i}. <b>{period}</b> | {doc_type}\n   📅 {publish_date} | <a href='{link}'>Открыть</a>\n"
         
-        await update.message.reply_text(
-            message,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+        await update.message.reply_text(message, parse_mode="HTML", disable_web_page_preview=True)
         
     finally:
         conn.close()
 
 
 async def stats_command(update, context):
-    """Статистика"""
     conn = init_db()
     
     try:
         cursor = conn.cursor()
         
-        # Отчёты
         cursor.execute("SELECT COUNT(*) FROM reports")
         total_reports = cursor.fetchone()[0]
         
@@ -398,7 +363,6 @@ async def stats_command(update, context):
         )
         by_year = cursor.fetchall()
         
-        # Подписчики
         cursor.execute("SELECT COUNT(*) FROM subscribers")
         total_subscribers = cursor.fetchone()[0]
         
@@ -421,27 +385,22 @@ async def stats_command(update, context):
 
 
 async def help_command(update, context):
-    """Помощь"""
     await update.message.reply_text(
         "📖 <b>Все команды:</b>\n\n"
         "/start — приветствие\n"
         "/list [страница] — все отчёты\n"
-        "/find &lt;год&gt; — поиск по году\n"
+        "/find <год> — поиск по году\n"
         "/check — проверить сейчас\n"
-        "/subscribe — подписаться на уведомления\n"
+        "/subscribe — подписаться\n"
         "/unsubscribe — отписаться\n"
         "/stats — статистика\n"
-        "/help — это сообщение\n\n"
-        "🤖 Бот автоматически проверяет новые отчёты каждый час "
-        "и уведомляет всех подписчиков.",
+        "/help — это сообщение",
         parse_mode="HTML"
     )
 
 
 # ==================== ЗАПУСК ====================
 async def post_init(application: Application):
-    """Запускается после старта бота"""
-    # Фоновая проверка каждый час
     application.job_queue.run_repeating(
         check_and_notify,
         interval=CHECK_INTERVAL,
@@ -455,13 +414,10 @@ async def main():
         print("ОШИБКА: BOT_TOKEN не задан!")
         return
     
-    # Инициализируем базу
     init_db()
     
-    # Бот
     application = Application.builder().token(TOKEN).post_init(post_init).build()
     
-    # Команды
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("check", check_command))
@@ -471,7 +427,7 @@ async def main():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("help", help_command))
     
-    # Веб-сервер для Railway (health check)
+    # Веб-сервер для Railway
     from aiohttp import web
     
     async def health_check(request):
@@ -486,9 +442,21 @@ async def main():
     await site.start()
     print(f"Health-check на порту {PORT}")
     
-    # Поехали!
+    # ===== ФИКС: вместо run_polling() =====
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
     print("Бот запущен!")
-    await application.run_polling()
+    
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 
 if __name__ == "__main__":
