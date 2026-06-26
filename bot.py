@@ -110,17 +110,29 @@ def unsubscribe_user(conn, chat_id):
 async def parse_reports():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+            locale="ru-RU"
+        )
+        page = await context.new_page()
         
         try:
             # Три попытки загрузить страницу
             for attempt in range(3):
                 try:
                     print(f"Попытка {attempt + 1} загрузить сайт...")
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    await page.wait_for_timeout(10000)  # ждём 10 секунд
-                    
-                    # Проверяем, есть ли таблица
+                    await page.goto(
+                        url,
+                        wait_until="networkidle",
+                        timeout=120000
+                    )
+                    await page.wait_for_timeout(5000)
+                    print("TITLE:", await page.title())
+                    print("URL:", page.url)
+                    content = await page.content()
+                    print(content[:3000])
+                    await page.screenshot(path="/tmp/debug.png", full_page=True)
                     await page.wait_for_selector("table tbody tr", timeout=30000)
                     print("Таблица найдена!")
                     break  # получилось — выходим из цикла попыток
@@ -181,6 +193,10 @@ async def parse_reports():
             return reports
             
         finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
             await browser.close()
 
 
