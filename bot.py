@@ -113,11 +113,26 @@ async def parse_reports():
         page = await browser.new_page()
         
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(5000)
-            await page.wait_for_selector("table tbody tr", timeout=20000)
+            # Три попытки загрузить страницу
+            for attempt in range(3):
+                try:
+                    print(f"Попытка {attempt + 1} загрузить сайт...")
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    await page.wait_for_timeout(10000)  # ждём 10 секунд
+                    
+                    # Проверяем, есть ли таблица
+                    await page.wait_for_selector("table tbody tr", timeout=30000)
+                    print("Таблица найдена!")
+                    break  # получилось — выходим из цикла попыток
+                    
+                except Exception as e:
+                    print(f"Попытка {attempt + 1} не удалась: {e}")
+                    if attempt == 2:  # последняя попытка
+                        raise
+                    await asyncio.sleep(5)  # ждём 5 сек перед следующей
             
             rows = await page.locator("table tbody tr").all()
+            print(f"Найдено строк: {len(rows)}")
             reports = []
             
             for row in rows:
@@ -162,6 +177,7 @@ async def parse_reports():
                 except Exception as e:
                     print(f"Ошибка парсинга строки: {e}")
             
+            print(f"Найдено бухгалтерских отчётов: {len(reports)}")
             return reports
             
         finally:
@@ -249,10 +265,14 @@ async def check_command(update, context):
     """Показывает все отчёты с сайта"""
     msg = await update.message.reply_text("🔍 Проверяю сайт...")
     
-    reports = await parse_reports()
+    try:
+        reports = await parse_reports()
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка при загрузке: {str(e)[:100]}")
+        return
     
     if not reports:
-        await msg.edit_text("❌ Не удалось загрузить отчёты.")
+        await msg.edit_text("❌ Не удалось загрузить отчёты. Возможно сайт недоступен.")
         return
     
     conn = init_db()
@@ -267,7 +287,12 @@ async def check_command(update, context):
             save_new_reports(conn, new_reports)
         
         # Показываем все отчёты, новые помечаем звёздочкой
-        message = f"📚 <b>Всего отчётов: {len(reports)}</b>\n\n"
+        if new_reports:
+            message = f"🔥 Новых: {len(new_reports)}\n\n"
+        else:
+            message = ""
+        
+        message += f"📚 <b>Всего отчётов: {len(reports)}</b>\n\n"
         
         keyboard = []
         for i, report in enumerate(reports, start=1):
@@ -285,9 +310,6 @@ async def check_command(update, context):
                         callback_data=f"open_{report['file_id']}"
                     )
                 ])
-        
-        if new_reports:
-            message = f"🔥 Новых: {len(new_reports)}\n\n" + message
         
         await msg.delete()
         await update.message.reply_text(
