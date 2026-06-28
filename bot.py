@@ -6,411 +6,165 @@ import time
 import random
 from datetime import datetime
 from urllib.parse import urljoin
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Set
 from difflib import SequenceMatcher
-from contextlib import contextmanager
+from collections import defaultdict
 
 from playwright.async_api import async_playwright
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application, 
-    CommandHandler, 
-    CallbackQueryHandler, 
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
     filters
 )
 from aiohttp import web
-import sqlite3
 
 # ==================== ЛОГИРОВАНИЕ ====================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot.log', encoding='utf-8')
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 # ==================== КОНФИГ ====================
-class Config:
-    BASE_URL = "https://msfo.valiullin.uk"
-    DB_FILE = "reports.db"
-    CHECK_INTERVAL = 3600
-    COMPANIES_FILE = "russian_stocks_ids.json"
-    MAX_RETRIES = 3
-    RETRY_DELAY = 5
-    TIMEOUT = 120000
-    CACHE_TTL = 300
-    SEARCH_TIMEOUT = 300
-    MAX_MESSAGE_LENGTH = 4000
-    RATE_LIMIT_DELAY = (5, 8)
-    
-    TOKEN = os.getenv("BOT_TOKEN")
-    PORT = int(os.getenv("PORT", 8080))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", "8080"))
+COMPANIES_FILE = "russian_stocks_ids.json"
+BASE_URL = "https://msfo.valiullin.uk"
+CHECK_INTERVAL = 3600
 
-# ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
-COMPANIES: List[Dict] = []
-BY_TICKER: Dict[str, Dict] = {}
-BY_NAME: Dict[str, Dict] = {}
+# ==================== ГЛОБАЛЬНЫЕ ДАННЫЕ ====================
+COMPANIES = []
+BY_TICKER = {}
+BY_NAME = {}
 
-parse_cache: Dict[str, Tuple[float, List[Dict]]] = {}
-search_results: Dict[str, Dict] = {}
+# Хранилище в памяти
+known_reports = defaultdict(set)  # company_id -> {file_ids}
+subscriptions = defaultdict(set)  # chat_id -> {company_ids}
+parse_cache = {}  # company_id -> (timestamp, data)
+search_results = {}  # chat_id -> {companies, timestamp}
 
 # ==================== ЗАГРУЗКА КОМПАНИЙ ====================
-def load_companies() -> Tuple[List[Dict], Dict[str, Dict], Dict[str, Dict]]:
-    """Загружает компании из JSON и строит индексы"""
-    global BY_TICKER, BY_NAME
+def load_companies():
+    global COMPANIES, BY_TICKER, BY_NAME
     
     try:
-        with open(Config.COMPANIES_FILE, "r", encoding="utf-8") as f:
+        with open(COMPANIES_FILE, "r", encoding="utf-8") as f:
             companies = json.load(f)
         
-        if not isinstance(companies, list):
-            raise ValueError("JSON должен содержать массив компаний")
+        BY_TICKER = {}
+        BY_NAME = {}
+        COMPANIES = []
         
-        by_ticker = {}
-        by_name = {}
-        valid_companies = []
-        
-        for company in companies:
-            if not isinstance(company, dict) or 'id' not in company:
-                logger.warning(f"Пропущена некорректная запись: {company}")
+        for c in companies:
+            if not isinstance(c, dict) or 'id' not in c:
                 continue
             
-            company_id = company.get('id')
-            if not company_id:
-                continue
-                
-            ticker = company.get("ticker", "").upper().strip()
-            name = company.get("name", "").strip()
+            c['ticker'] = c.get('ticker', '').upper().strip()
+            c['name'] = c.get('name', '').strip()
             
-            if not name:
-                logger.warning(f"Компания с ID {company_id} не имеет названия")
+            if not c['name']:
                 continue
             
-            valid_companies.append(company)
-            
-            if ticker:
-                by_ticker[ticker] = company
-            if name:
-                by_name[name.lower()] = company
+            COMPANIES.append(c)
+            if c['ticker']:
+                BY_TICKER[c['ticker']] = c
+            BY_NAME[c['name'].lower()] = c
         
-        BY_TICKER = by_ticker
-        BY_NAME = by_name
-        
-        logger.info(f"Загружено {len(valid_companies)} компаний")
-        return valid_companies, by_ticker, by_name
-        
-    except FileNotFoundError:
-        logger.error(f"Файл {Config.COMPANIES_FILE} не найден")
-        return [], {}, {}
-    except json.JSONDecodeError as e:
-        logger.error(f"Ошибка парсинга JSON: {e}")
-        return [], {}, {}
+        logger.info(f"Загружено компаний: {len(COMPANIES)}")
+        return True
     except Exception as e:
-        logger.error(f"Неожиданная ошибка при загрузке компаний: {e}")
-        return [], {}, {}
+        logger.error(f"Ошибка загрузки компаний: {e}")
+        return False
 
 
-def search_companies(query: str) -> List[Dict]:
-    """Поиск компаний по тикеру или названию с частичным совпадением"""
-    if not query or not query.strip():
+def search_companies(query):
+    if not query:
         return []
     
-    query = query.strip().upper()
+    query_upper = query.strip().upper()
+    query_lower = query.strip().lower()
     results = []
-    seen_ids = set()
+    seen = set()
     
-    if query in BY_TICKER:
-        company = BY_TICKER[query]
-        results.append(company)
-        seen_ids.add(company['id'])
+    # Точное совпадение по тикеру
+    if query_upper in BY_TICKER:
+        c = BY_TICKER[query_upper]
+        results.append(c)
+        seen.add(c['id'])
     
-    for ticker, company in BY_TICKER.items():
-        if company['id'] not in seen_ids and query in ticker:
-            results.append(company)
-            seen_ids.add(company['id'])
+    # Частичное по тикеру
+    for ticker, c in BY_TICKER.items():
+        if c['id'] not in seen and query_upper in ticker:
+            results.append(c)
+            seen.add(c['id'])
     
-    query_lower = query.lower()
-    for name, company in BY_NAME.items():
-        if company['id'] not in seen_ids and query_lower in name:
-            results.append(company)
-            seen_ids.add(company['id'])
+    # Частичное по названию
+    for name, c in BY_NAME.items():
+        if c['id'] not in seen and query_lower in name:
+            results.append(c)
+            seen.add(c['id'])
     
-    def relevance(company: Dict) -> float:
-        name = company.get("name", "").lower()
-        ticker = company.get("ticker", "").lower()
-        name_score = SequenceMatcher(None, query_lower, name).ratio()
-        ticker_score = SequenceMatcher(None, query_lower, ticker).ratio()
-        return max(name_score, ticker_score)
-    
-    results.sort(key=relevance, reverse=True)
-    return results
+    # Сортировка по релевантности
+    results.sort(key=lambda c: SequenceMatcher(None, query_lower, c['name'].lower()).ratio(), reverse=True)
+    return results[:20]
 
 
-def get_company_by_id(company_id: int) -> Optional[Dict]:
-    """Находит компанию по ID"""
-    for company in COMPANIES:
-        if company["id"] == company_id:
-            return company
+def get_company(company_id):
+    for c in COMPANIES:
+        if c['id'] == company_id:
+            return c
     return None
 
 
-def format_company_info(company: Dict) -> str:
-    """Форматирует информацию о компании"""
-    name = company.get('name', 'Н/Д')
-    ticker = company.get('ticker', '')
-    if ticker:
-        return f"<b>{name}</b> ({ticker})"
-    return f"<b>{name}</b>"
-
-
-# ==================== РАБОТА С БАЗОЙ ДАННЫХ ====================
-@contextmanager
-def get_db():
-    """Контекстный менеджер для работы с БД"""
-    conn = sqlite3.connect(Config.DB_FILE)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Ошибка БД: {e}")
-        raise
-    finally:
-        conn.close()
-
-
-def init_db():
-    """Инициализация базы данных"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS reports (
-                file_id TEXT,
-                company_id INTEGER,
-                report_num TEXT,
-                doc_type TEXT,
-                period TEXT,
-                foundation_date TEXT,
-                publish_date TEXT,
-                first_seen TEXT,
-                last_seen TEXT,
-                PRIMARY KEY (file_id, company_id)
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                chat_id TEXT,
-                company_id INTEGER,
-                subscribed_at TEXT,
-                PRIMARY KEY (chat_id, company_id)
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                chat_id TEXT PRIMARY KEY,
-                username TEXT,
-                first_seen TEXT,
-                last_active TEXT
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_reports_company 
-            ON reports(company_id)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_subscriptions_chat 
-            ON subscriptions(chat_id)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_subscriptions_company 
-            ON subscriptions(company_id)
-        """)
-        
-        conn.commit()
-        logger.info("База данных инициализирована")
-
-
-def get_known_ids(conn, company_id: int) -> Set[str]:
-    """Получает известные file_id для компании"""
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT file_id FROM reports WHERE company_id = ?", 
-        (company_id,)
-    )
-    return {row[0] for row in cursor.fetchall()}
-
-
-def save_new_reports(conn, new_reports: List[Dict], company_id: int):
-    """Сохраняет новые отчеты"""
-    cursor = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    for report in new_reports:
-        try:
-            cursor.execute("""
-                INSERT OR IGNORE INTO reports 
-                (file_id, company_id, report_num, doc_type, period, 
-                 foundation_date, publish_date, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                report['file_id'], company_id, report['num'], 
-                report['doc_type'], report['period'], 
-                report['foundation'], report['publish'],
-                now, now
-            ))
-        except Exception as e:
-            logger.error(f"Ошибка сохранения отчета: {e}")
-    
-    conn.commit()
-
-
-def update_last_seen(conn, file_ids: Set[str], company_id: int):
-    """Обновляет время последнего обнаружения"""
-    cursor = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    for file_id in file_ids:
-        cursor.execute(
-            "UPDATE reports SET last_seen = ? WHERE file_id = ? AND company_id = ?",
-            (now, file_id, company_id)
-        )
-    
-    conn.commit()
-
-
-def get_subscribers_for_company(conn, company_id: int) -> List[str]:
-    """Получает всех подписчиков конкретной компании"""
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT chat_id FROM subscriptions WHERE company_id = ?", 
-        (company_id,)
-    )
-    return [row[0] for row in cursor.fetchall()]
-
-
-def get_user_subscriptions(conn, chat_id: str) -> List[int]:
-    """Получает все подписки пользователя"""
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT company_id FROM subscriptions WHERE chat_id = ?", 
-        (chat_id,)
-    )
-    return [row[0] for row in cursor.fetchall()]
-
-
-def subscribe_user_to_company(conn, chat_id: str, company_id: int):
-    """Подписывает пользователя на компанию"""
-    cursor = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("""
-        INSERT OR REPLACE INTO subscriptions (chat_id, company_id, subscribed_at)
-        VALUES (?, ?, ?)
-    """, (chat_id, company_id, now))
-    conn.commit()
-    logger.info(f"Пользователь {chat_id} подписан на компанию {company_id}")
-
-
-def unsubscribe_user_from_company(conn, chat_id: str, company_id: int):
-    """Отписывает пользователя от компании"""
-    cursor = conn.cursor()
-    cursor.execute(
-        "DELETE FROM subscriptions WHERE chat_id = ? AND company_id = ?",
-        (chat_id, company_id)
-    )
-    conn.commit()
-    logger.info(f"Пользователь {chat_id} отписан от компании {company_id}")
-
-
-def update_user_activity(conn, chat_id: str, username: str):
-    """Обновляет активность пользователя"""
-    cursor = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("""
-        INSERT INTO users (chat_id, username, first_seen, last_active)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET 
-            username = excluded.username,
-            last_active = excluded.last_active
-    """, (chat_id, username, now, now))
-    conn.commit()
-
-
-def cleanup_search_state():
-    """Очищает устаревшие состояния поиска"""
-    current_time = time.time()
-    expired_chats = [
-        chat_id for chat_id, data in search_results.items()
-        if current_time - data.get('timestamp', 0) > Config.SEARCH_TIMEOUT
-    ]
-    for chat_id in expired_chats:
-        del search_results[chat_id]
-    if expired_chats:
-        logger.debug(f"Очищено {len(expired_chats)} устаревших состояний поиска")
+def format_company(c):
+    name = c['name']
+    ticker = c['ticker']
+    return f"<b>{name}</b> ({ticker})" if ticker else f"<b>{name}</b>"
 
 
 # ==================== ПАРСЕР ====================
-async def parse_reports(company_id: int) -> List[Dict]:
-    """Парсит отчеты для конкретной компании"""
-    if not get_company_by_id(company_id):
-        logger.warning(f"Компания с ID {company_id} не найдена")
-        return []
-    
+async def parse_reports(company_id):
     url = f"https://www.e-disclosure.ru/portal/files.aspx?id={company_id}&type=3"
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             viewport={"width": 1920, "height": 1080},
             locale="ru-RU"
         )
         page = await context.new_page()
         
         try:
-            for attempt in range(Config.MAX_RETRIES):
+            # 3 попытки загрузки
+            for attempt in range(3):
                 try:
-                    logger.debug(f"Попытка {attempt + 1} загрузить компанию {company_id}")
-                    await page.goto(url, wait_until="networkidle", timeout=Config.TIMEOUT)
+                    await page.goto(url, wait_until="networkidle", timeout=120000)
                     await page.wait_for_timeout(5000)
-                    
                     await page.wait_for_selector("table tbody tr", timeout=30000)
-                    logger.debug(f"Таблица найдена для компании {company_id}")
                     break
-                    
                 except Exception as e:
-                    logger.warning(f"Попытка {attempt + 1} для компании {company_id} не удалась: {e}")
-                    if attempt == Config.MAX_RETRIES - 1:
+                    if attempt == 2:
                         raise
-                    await asyncio.sleep(Config.RETRY_DELAY)
+                    await asyncio.sleep(5)
             
             rows = await page.locator("table tbody tr").all()
-            logger.info(f"Найдено строк для компании {company_id}: {len(rows)}")
             reports = []
             
             for row in rows:
                 try:
                     cells = await row.locator("td").all()
-                    
                     if len(cells) < 6:
                         continue
                     
-                    report_num = (await cells[0].inner_text()).strip()
                     doc_type = (await cells[1].inner_text()).strip()
-                    period = (await cells[2].inner_text()).strip()
-                    foundation_date = (await cells[3].inner_text()).strip()
-                    publish_date = (await cells[4].inner_text()).strip()
-                    
                     if "бухгалтер" not in doc_type.lower():
                         continue
                     
@@ -419,539 +173,431 @@ async def parse_reports(company_id: int) -> List[Dict]:
                         continue
                     
                     href = await link.first.get_attribute("href")
-                    if not href:
+                    if not href or "Fileid=" not in href:
                         continue
-                    
-                    file_url = urljoin(url, href)
-                    if "Fileid=" not in file_url:
-                        continue
-                    
-                    file_id = file_url.split("Fileid=")[1]
                     
                     reports.append({
-                        "num": report_num,
+                        "period": (await cells[2].inner_text()).strip(),
                         "doc_type": doc_type,
-                        "period": period,
-                        "foundation": foundation_date,
-                        "publish": publish_date,
-                        "file_id": file_id
+                        "publish": (await cells[4].inner_text()).strip(),
+                        "file_id": href.split("Fileid=")[1]
                     })
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка парсинга строки для компании {company_id}: {e}")
+                except Exception:
+                    continue
             
-            logger.info(f"Найдено отчетов для компании {company_id}: {len(reports)}")
+            logger.info(f"Компания {company_id}: найдено {len(reports)} отчетов")
             return reports
             
         finally:
-            try:
-                await context.close()
-            except Exception:
-                pass
+            await context.close()
             await browser.close()
 
 
-async def parse_reports_cached(company_id: int) -> List[Dict]:
-    """Кэширует результаты парсинга"""
-    cache_key = f"company_{company_id}"
-    
-    if cache_key in parse_cache:
-        cached_time, cached_data = parse_cache[cache_key]
-        if time.time() - cached_time < Config.CACHE_TTL:
-            logger.debug(f"Использован кэш для компании {company_id}")
-            return cached_data
+async def parse_reports_cached(company_id):
+    now = time.time()
+    if company_id in parse_cache:
+        cached_time, data = parse_cache[company_id]
+        if now - cached_time < 300:  # 5 минут
+            return data
     
     data = await parse_reports(company_id)
-    parse_cache[cache_key] = (time.time(), data)
+    parse_cache[company_id] = (now, data)
     return data
 
 
-# ==================== УВЕДОМЛЕНИЯ ПОДПИСЧИКАМ ====================
+# ==================== ПРОВЕРКА И УВЕДОМЛЕНИЯ ====================
 async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
-    """Фоновая проверка для всех компаний с подписками"""
-    logger.info("Запуск фоновой проверки")
+    logger.info("Фоновая проверка...")
     
-    with get_db() as conn:
+    # Собираем уникальные company_id
+    company_ids = set()
+    for comps in subscriptions.values():
+        company_ids.update(comps)
+    
+    if not company_ids:
+        return
+    
+    for company_id in company_ids:
         try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT company_id FROM subscriptions")
-            company_ids = [row[0] for row in cursor.fetchall()]
+            company = get_company(company_id)
+            if not company:
+                continue
             
-            if not company_ids:
-                logger.info("Нет активных подписок")
-                return
+            reports = await parse_reports(company_id)
+            if not reports:
+                continue
             
-            logger.info(f"Проверяю {len(company_ids)} компаний...")
+            # Ищем новые
+            known = known_reports.get(company_id, set())
+            new_reports = [r for r in reports if r['file_id'] not in known]
             
-            for i, company_id in enumerate(company_ids):
-                try:
-                    company = get_company_by_id(company_id)
-                    if not company:
-                        logger.warning(f"Компания с ID {company_id} не найдена")
-                        continue
-                    
-                    logger.info(f"Проверяю {company.get('name', 'Н/Д')} ({i+1}/{len(company_ids)})")
-                    reports = await parse_reports(company_id)
-                    
-                    if not reports:
-                        logger.info(f"Нет отчетов для {company.get('name', 'Н/Д')}")
-                        continue
-                    
-                    known_ids = get_known_ids(conn, company_id)
-                    new_reports = [r for r in reports if r['file_id'] not in known_ids]
-                    
-                    all_file_ids = {r['file_id'] for r in reports}
-                    update_last_seen(conn, all_file_ids, company_id)
-                    
-                    if new_reports:
-                        save_new_reports(conn, new_reports, company_id)
-                        
-                        message = f"🔥 <b>Новые отчёты {format_company_info(company)}</b> ({len(new_reports)}):\n\n"
-                        
-                        for j, report in enumerate(new_reports[:20], start=1):
-                            message += (
-                                f"{j}. <b>{report['period']}</b>\n"
-                                f"   📄 {report['doc_type']}\n"
-                                f"   📅 {report['publish']}\n\n"
-                            )
-                        
-                        keyboard = []
-                        for j, report in enumerate(new_reports[:10], start=1):
-                            keyboard.append([
-                                InlineKeyboardButton(
-                                    f"Открыть: {report['period'][:30]}",
-                                    callback_data=f"open_{report['file_id']}"
-                                )
-                            ])
-                        
-                        subscribers = get_subscribers_for_company(conn, company_id)
-                        sent_count = 0
-                        
-                        for chat_id in subscribers:
-                            try:
-                                await context.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=message[:Config.MAX_MESSAGE_LENGTH],
-                                    parse_mode="HTML",
-                                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-                                )
-                                sent_count += 1
-                                await asyncio.sleep(0.05)
-                            except Exception as e:
-                                logger.error(f"Не удалось отправить {chat_id}: {e}")
-                                if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
-                                    unsubscribe_user_from_company(conn, chat_id, company_id)
-                        
-                        logger.info(f"Уведомлений для {company.get('name')}: {sent_count}/{len(subscribers)}")
-                    else:
-                        logger.info(f"Новых отчётов для {company.get('name')} нет")
-                    
-                    if i < len(company_ids) - 1:
-                        delay = random.uniform(*Config.RATE_LIMIT_DELAY)
-                        await asyncio.sleep(delay)
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка при проверке компании {company_id}: {e}")
-                    continue
+            # Обновляем известные
+            for r in reports:
+                known_reports[company_id].add(r['file_id'])
+            
+            if new_reports:
+                # Формируем сообщение
+                msg = f"🔥 <b>Новые отчёты {format_company(company)}</b> ({len(new_reports)}):\n\n"
+                for i, r in enumerate(new_reports[:10], 1):
+                    msg += f"{i}. <b>{r['period']}</b>\n   📄 {r['doc_type']}\n   📅 {r['publish']}\n\n"
                 
+                # Кнопки
+                keyboard = []
+                for r in new_reports[:5]:
+                    keyboard.append([InlineKeyboardButton(
+                        f"Открыть: {r['period'][:30]}",
+                        callback_data=f"open_{r['file_id']}"
+                    )])
+                
+                # Отправляем подписчикам
+                subscribers = [cid for cid, comps in subscriptions.items() if company_id in comps]
+                for chat_id in subscribers:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=msg[:4000],
+                            parse_mode="HTML",
+                            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+                        )
+                        await asyncio.sleep(0.05)
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки {chat_id}: {e}")
+                        if "blocked" in str(e).lower():
+                            subscriptions[chat_id].discard(company_id)
+                
+                logger.info(f"Уведомлений: {len(subscribers)}")
+            
+            await asyncio.sleep(random.uniform(5, 8))
+            
         except Exception as e:
-            logger.error(f"Ошибка при проверке: {e}")
+            logger.error(f"Ошибка проверки {company_id}: {e}")
     
     parse_cache.clear()
-    logger.info("Фоновая проверка завершена")
 
 
-# ==================== КОМАНДЫ БОТА ====================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начальная команда"""
+# ==================== КОМАНДЫ ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 <b>Привет! Я парсер бухгалтерских отчётов.</b>\n\n"
-        "🔍 <b>Поиск отчётов:</b>\n"
-        "/check Газпром — посмотреть отчёты\n\n"
-        "📬 <b>Подписки:</b>\n"
-        "/subscribe Газпром — подписаться на уведомления\n"
+        "👋 <b>Парсер бухгалтерских отчётов</b>\n\n"
+        "/check Газпром — посмотреть отчёты\n"
+        "/subscribe Газпром — подписаться\n"
         "/unsubscribe Газпром — отписаться\n"
-        "/subscriptions — мои подписки\n\n"
-        "💡 <b>Советы:</b>\n"
-        "• Можно искать по тикеру: /check GAZP\n"
-        "• Можно искать по части названия: /check газ\n"
-        "• При частичном поиске бот покажет список\n\n"
-        "❓ /help — подробная помощь",
+        "/subscriptions — мои подписки\n"
+        "/help — помощь",
         parse_mode="HTML"
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Помощь"""
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📚 <b>Помощь по боту</b>\n\n"
-        "🔍 <b>Поиск отчётов:</b>\n"
-        "/check Компания — показать бухгалтерские отчёты\n"
-        "Пример: /check Газпром\n\n"
-        "📬 <b>Подписки:</b>\n"
-        "/subscribe Компания — подписаться на уведомления\n"
-        "/unsubscribe Компания — отписаться\n"
-        "/subscriptions — мои подписки\n\n"
-        "💡 <b>Советы:</b>\n"
-        "• Можно искать по тикеру: GAZP, SBER, VTBR\n"
-        "• Можно искать по части названия: 'газ', 'нефть'\n"
-        "• При частичном поиске бот покажет список совпадений\n"
-        "• Уведомления приходят только по новым отчётам\n\n"
-        "🔄 Проверка новых отчётов — каждый час\n"
-        "⏱ Отчеты кэшируются на 5 минут",
+        "📚 <b>Помощь</b>\n\n"
+        "/check КОМПАНИЯ — отчёты\n"
+        "/subscribe КОМПАНИЯ — подписка\n"
+        "/unsubscribe КОМПАНИЯ — отписка\n"
+        "/subscriptions — список подписок\n\n"
+        "Поиск по тикеру: GAZP, SBER\n"
+        "Поиск по названию: Газпром, Сбербанк\n"
+        "Частичный поиск: газ, сбер",
         parse_mode="HTML"
     )
 
 
-async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка отчетов конкретной компании"""
-    chat_id = str(update.effective_chat.id)
-    
-    username = update.effective_user.username or update.effective_user.first_name or "unknown"
-    with get_db() as conn:
-        update_user_activity(conn, chat_id, username)
-    
+async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(
-            "❌ Укажите компанию. Например:\n"
-            "/check Газпром\n"
-            "/check GAZP"
-        )
+        await update.message.reply_text("❌ Укажите компанию: /check Газпром")
         return
     
     query = " ".join(context.args)
     results = search_companies(query)
     
     if not results:
-        await update.message.reply_text(
-            f"❌ Компания '{query}' не найдена\n"
-            "Проверьте название или используйте тикер"
-        )
+        await update.message.reply_text(f"❌ Компания '{query}' не найдена")
         return
     
     if len(results) == 1:
-        await show_company_reports(update, context, results[0])
+        await show_reports(update, results[0])
     else:
-        cleanup_search_state()
-        
-        search_results[chat_id] = {
+        search_results[str(update.effective_chat.id)] = {
             "companies": results,
             "timestamp": time.time()
         }
         
-        message = f"🔍 <b>Найдено несколько компаний по запросу '{query}':</b>\n\n"
-        for i, company in enumerate(results[:20], 1):
-            message += f"{i}. {format_company_info(company)}\n"
+        msg = f"🔍 <b>Найдено несколько компаний:</b>\n\n"
+        for i, c in enumerate(results, 1):
+            msg += f"{i}. {format_company(c)}\n"
+        msg += "\nВведите номер или уточните запрос"
         
-        if len(results) > 20:
-            message += f"\n... и ещё {len(results) - 20}"
-        
-        message += "\nВведите номер компании или уточните запрос.\n/search отмена — отменить поиск"
-        
-        await update.message.reply_text(message, parse_mode="HTML")
+        await update.message.reply_text(msg, parse_mode="HTML")
 
 
-async def show_company_reports(update: Update, context: ContextTypes.DEFAULT_TYPE, company: Dict):
-    """Показывает отчеты выбранной компании"""
-    msg = await update.message.reply_text(
-        f"🔍 Проверяю {format_company_info(company)}...", 
-        parse_mode="HTML"
-    )
+async def show_reports(update: Update, company):
+    chat_id = str(update.effective_chat.id)
+    msg = await update.message.reply_text(f"🔍 Проверяю {format_company(company)}...", parse_mode="HTML")
     
     try:
-        reports = await parse_reports_cached(company["id"])
+        reports = await parse_reports_cached(company['id'])
     except Exception as e:
-        logger.error(f"Ошибка при загрузке отчетов для {company.get('name')}: {e}")
-        await msg.edit_text(
-            f"❌ Ошибка при загрузке отчетов для {format_company_info(company)}\n"
-            f"Попробуйте позже",
-            parse_mode="HTML"
-        )
+        await msg.edit_text(f"❌ Ошибка загрузки: {e}")
         return
     
     if not reports:
-        await msg.edit_text(
-            f"📊 {format_company_info(company)}\n"
-            f"❌ Бухгалтерские отчёты не найдены",
-            parse_mode="HTML"
-        )
+        await msg.edit_text(f"📊 {format_company(company)}\n❌ Отчёты не найдены", parse_mode="HTML")
         return
     
-    with get_db() as conn:
-        known_ids = get_known_ids(conn, company["id"])
-        new_reports = [r for r in reports if r['file_id'] not in known_ids]
-        
-        all_file_ids = {r['file_id'] for r in reports}
-        update_last_seen(conn, all_file_ids, company["id"])
-        
-        if new_reports:
-            save_new_reports(conn, new_reports, company["id"])
-        
-        message = f"📊 {format_company_info(company)}\n"
-        if new_reports:
-            message += f"🔥 Новых: {len(new_reports)}\n\n"
-        else:
-            message += "\n"
-        
-        message += f"📚 <b>Всего отчётов: {len(reports)}</b>\n\n"
-        
-        keyboard = []
-        for i, report in enumerate(reports[:20], start=1):
-            is_new = "⭐ " if report['file_id'] not in known_ids else ""
-            message += (
-                f"{is_new}{i}. <b>{report['period']}</b>\n"
-                f"   📄 {report['doc_type']}\n"
-                f"   📅 {report['publish']}\n\n"
-            )
-            
-            if i <= 10:
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"{'🆕 ' if report['file_id'] not in known_ids else ''}{report['period'][:30]}",
-                        callback_data=f"open_{report['file_id']}"
-                    )
-                ])
-        
-        await msg.delete()
-        
-        if len(message) > Config.MAX_MESSAGE_LENGTH:
-            parts = []
-            current_part = ""
-            
-            for line in message.split('\n'):
-                if len(current_part) + len(line) + 1 > Config.MAX_MESSAGE_LENGTH:
-                    parts.append(current_part)
-                    current_part = line + '\n'
-                else:
-                    current_part += line + '\n'
-            
-            if current_part:
-                parts.append(current_part)
-            
-            for part in parts[:-1]:
-                await update.message.reply_text(part, parse_mode="HTML")
-            
-            await update.message.reply_text(
-                parts[-1],
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-            )
-        else:
-            await update.message.reply_text(
-                message,
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-            )
+    known = known_reports.get(company['id'], set())
+    new = [r for r in reports if r['file_id'] not in known]
+    
+    for r in reports:
+        known_reports[company['id']].add(r['file_id'])
+    
+    text = f"📊 {format_company(company)}\n"
+    if new:
+        text += f"🔥 Новых: {len(new)}\n\n"
+    else:
+        text += "\n"
+    
+    text += f"📚 Всего отчётов: {len(reports)}\n\n"
+    
+    keyboard = []
+    for i, r in enumerate(reports[:10], 1):
+        star = "⭐ " if r['file_id'] not in known else ""
+        text += f"{star}{i}. <b>{r['period']}</b>\n   📄 {r['doc_type']}\n   📅 {r['publish']}\n\n"
+        keyboard.append([InlineKeyboardButton(
+            f"{'🆕 ' if r['file_id'] not in known else ''}{r['period'][:30]}",
+            callback_data=f"open_{r['file_id']}"
+        )])
+    
+    await msg.delete()
+    
+    # Разбиваем длинные сообщения
+    if len(text) > 4000:
+        for part in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+            await update.message.reply_text(part, parse_mode="HTML")
+    else:
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений"""
     chat_id = str(update.effective_chat.id)
     text = update.message.text.strip()
     
-    cleanup_search_state()
+    # Очистка старых поисков
+    now = time.time()
+    expired = [cid for cid, data in search_results.items() if now - data['timestamp'] > 300]
+    for cid in expired:
+        del search_results[cid]
     
-    if text.lower() in ['/search отмена', 'отмена', 'cancel']:
+    if text.lower() in ['отмена', 'cancel']:
         if chat_id in search_results:
             del search_results[chat_id]
             await update.message.reply_text("❌ Поиск отменен")
-        else:
-            await update.message.reply_text("Нет активного поиска для отмены")
         return
     
     if chat_id in search_results:
         try:
-            index = int(text) - 1
-            companies = search_results[chat_id]["companies"]
-            if 0 <= index < len(companies):
-                company = companies[index]
+            idx = int(text) - 1
+            companies = search_results[chat_id]['companies']
+            if 0 <= idx < len(companies):
                 del search_results[chat_id]
-                await show_company_reports(update, context, company)
-                return
-            else:
-                await update.message.reply_text(
-                    f"❌ Неверный номер. Выберите от 1 до {len(companies)}"
-                )
+                await show_reports(update, companies[idx])
                 return
         except ValueError:
             del search_results[chat_id]
-    
-    await update.message.reply_text(
-        "Используйте команды:\n"
-        "/check Компания — посмотреть отчёты\n"
-        "/subscribe Компания — подписаться\n"
-        "/help — помощь"
-    )
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок"""
     query = update.callback_query
     await query.answer()
     
     if query.data.startswith("open_"):
-        file_id = query.data.replace("open_", "")
-        link = f"{Config.BASE_URL}/view/{file_id}"
+        file_id = query.data[5:]
         await query.message.reply_text(
-            f"🔗 <a href='{link}'>Открыть отчёт</a>",
+            f"🔗 <a href='{BASE_URL}/view/{file_id}'>Открыть отчёт</a>",
             parse_mode="HTML"
         )
 
 
-async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подписка на компанию"""
+async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    username = update.effective_user.username or update.effective_user.first_name or "unknown"
     
     if not context.args:
-        await update.message.reply_text(
-            "❌ Укажите компанию. Например:\n"
-            "/subscribe Газпром\n"
-            "/subscribe GAZP"
-        )
+        await update.message.reply_text("❌ Укажите компанию: /subscribe Газпром")
         return
     
     query = " ".join(context.args)
     results = search_companies(query)
     
     if not results:
-        await update.message.reply_text(
-            f"❌ Компания '{query}' не найдена\n"
-            "Проверьте название или используйте тикер"
-        )
+        await update.message.reply_text(f"❌ Компания '{query}' не найдена")
         return
     
     if len(results) == 1:
-        company = results[0]
-        with get_db() as conn:
-            update_user_activity(conn, chat_id, username)
-            subscribe_user_to_company(conn, chat_id, company["id"])
-        
-        ticker = company.get('ticker', '')
-        unsub_hint = f" /unsubscribe {ticker}" if ticker else ""
-        
+        c = results[0]
+        subscriptions[chat_id].add(c['id'])
+        ticker = c['ticker']
+        hint = f" /unsubscribe {ticker}" if ticker else ""
         await update.message.reply_text(
-            f"✅ Подписка оформлена на {format_company_info(company)}\n"
-            f"Новые отчёты будут приходить автоматически.{unsub_hint}",
+            f"✅ Подписка на {format_company(c)}{hint}",
             parse_mode="HTML"
         )
     else:
-        with get_db() as conn:
-            user_subs = get_user_subscriptions(conn, chat_id)
-            already_subscribed = [c for c in results if c["id"] in user_subs]
-        
-        if already_subscribed and len(already_subscribed) == len(results):
-            await update.message.reply_text(
-                f"❌ Вы уже подписаны на все компании по запросу '{query}'"
-            )
+        msg = f"🔍 <b>Найдено несколько компаний:</b>\n\n"
+        for i, c in enumerate(results, 1):
+            subbed = "✅" if c['id'] in subscriptions[chat_id] else "➕"
+            msg += f"{i}. {subbed} {format_company(c)}\n"
+        msg += "\nУточните запрос"
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    
+    if not context.args:
+        subs = subscriptions.get(chat_id, set())
+        if not subs:
+            await update.message.reply_text("❌ Нет подписок")
             return
         
-        message = f"🔍 <b>Найдено несколько компаний по запросу '{query}':</b>\n\n"
-        for i, company in enumerate(results[:20], 1):
-            status = "✅" if company in already_subscribed else "➕"
-            message += f"{i}. {status} {format_company_info(company)}\n"
-        
-        if len(results) > 20:
-            message += f"\n... и ещё {len(results) - 20}"
-        
-        message += "\nУточните запрос, например:\n/subscribe Газпром нефть"
-        
-        await update.message.reply_text(message, parse_mode="HTML")
-
-
-async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отписка от компании"""
-    chat_id = str(update.effective_chat.id)
-    
-    if not context.args:
-        with get_db() as conn:
-            user_subs = get_user_subscriptions(conn, chat_id)
-            
-            if not user_subs:
-                await update.message.reply_text(
-                    "❌ У вас нет активных подписок.\n"
-                    "/subscribe Компания — подписаться"
-                )
-                return
-            
-            message = "📬 <b>Ваши подписки:</b>\n\n"
-            for company_id in user_subs:
-                company = get_company_by_id(company_id)
-                if company:
-                    ticker = company.get('ticker', '')
-                    message += f"• {format_company_info(company)}\n"
-                    if ticker:
-                        message += f"  /unsubscribe {ticker}\n"
-                    else:
-                        message += f"  /unsubscribe {company['name']}\n"
-            
-            message += "\nИспользуйте /unsubscribe с тикером или названием компании"
-            await update.message.reply_text(message, parse_mode="HTML")
+        msg = "📬 <b>Ваши подписки:</b>\n\n"
+        for cid in subs:
+            c = get_company(cid)
+            if c:
+                msg += f"• {format_company(c)}\n"
+                if c['ticker']:
+                    msg += f"  /unsubscribe {c['ticker']}\n"
+        await update.message.reply_text(msg, parse_mode="HTML")
         return
     
     query = " ".join(context.args)
     results = search_companies(query)
     
     if not results:
-        await update.message.reply_text(
-            f"❌ Компания '{query}' не найдена\n"
-            "Проверьте название или используйте тикер"
-        )
+        await update.message.reply_text(f"❌ Компания '{query}' не найдена")
         return
     
     if len(results) == 1:
-        company = results[0]
-        with get_db() as conn:
-            user_subs = get_user_subscriptions(conn, chat_id)
-            
-            if company["id"] not in user_subs:
-                await update.message.reply_text(
-                    f"❌ Вы не подписаны на {format_company_info(company)}",
-                    parse_mode="HTML"
-                )
-                return
-            
-            unsubscribe_user_from_company(conn, chat_id, company["id"])
-        
-        ticker = company.get('ticker', '')
-        sub_hint = f" /subscribe {ticker}" if ticker else ""
-        
+        c = results[0]
+        subscriptions[chat_id].discard(c['id'])
+        ticker = c['ticker']
+        hint = f" /subscribe {ticker}" if ticker else ""
         await update.message.reply_text(
-            f"❌ Отписка от {format_company_info(company)}\n"
-            f"Вы больше не будете получать уведомления.{sub_hint}",
+            f"❌ Отписка от {format_company(c)}{hint}",
             parse_mode="HTML"
         )
     else:
-        with get_db() as conn:
-            user_subs = get_user_subscriptions(conn, chat_id)
-            subscribed_results = [c for c in results if c["id"] in user_subs]
-            
-            if not subscribed_results:
-                await update.message.reply_text(
-                    f"❌ Вы не подписаны на компании по запросу '{query}'"
-                )
-                return
-            
-            if len(subscribed_results) == 1:
-                company = subscribed_results[0]
-                unsubscribe_user_from_company(conn, chat_id, company["id"])
-                
-                ticker = company.get('ticker', '')
-                sub_hint = f" /subscribe {ticker}" if ticker else ""
-                
-                await update.message.reply_text(
-                    f"❌ Отписка от {format_company_info(company)}\n"
-                    f"Вы больше не будете получать уведомления.{sub_hint}",
-                    parse_mode="HTML"
-                )
-            else:
-                message = f"🔍 <b>Вы подписаны на несколько компаний из списка:</b>\n\n"
-                for i, company in enumerate(subscribed_results[:20], 1):
-                    ticker = company.get('ticker', '')
-                    message += f"{i}. {format_company_info(company)}\n"
-                    if ticker:
-                        message += f"   /unsubscribe {ticker}\n"
-                    else:
-                        message += f"   /unsubscribe {company['name']}\n"
-                
-               
+        subs = subscriptions.get(chat_id, set())
+        subbed = [c for c in results if c['id'] in subs]
+        
+        if not subbed:
+            await update.message.reply_text(f"❌ Нет подписок по запросу '{query}'")
+        elif len(subbed) == 1:
+            c = subbed[0]
+            subscriptions[chat_id].discard(c['id'])
+            await update.message.reply_text(f"❌ Отписка от {format_company(c)}", parse_mode="HTML")
+        else:
+            msg = f"🔍 <b>Найдено несколько подписок:</b>\n\n"
+            for i, c in enumerate(subbed, 1):
+                msg += f"{i}. {format_company(c)}\n"
+                if c['ticker']:
+                    msg += f"   /unsubscribe {c['ticker']}\n"
+            msg += "\nУточните запрос"
+            await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def subscriptions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    subs = subscriptions.get(chat_id, set())
+    
+    if not subs:
+        await update.message.reply_text("❌ Нет подписок\n/subscribe КОМПАНИЯ — подписаться")
+        return
+    
+    msg = "📬 <b>Ваши подписки:</b>\n\n"
+    for cid in subs:
+        c = get_company(cid)
+        if c:
+            msg += f"• {format_company(c)}\n"
+            if c['ticker']:
+                msg += f"  /unsubscribe {c['ticker']}\n"
+    
+    msg += f"\nВсего: {len(subs)}"
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# ==================== ОБРАБОТКА ОШИБОК ====================
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Ошибка: {context.error}")
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text("❌ Произошла ошибка")
+        except Exception:
+            pass
+
+
+# ==================== ЗАПУСК ====================
+async def post_init(app: Application):
+    app.job_queue.run_repeating(check_and_notify, interval=CHECK_INTERVAL, first=10)
+    logger.info("Фоновая проверка запущена")
+
+
+async def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN не задан!")
+        return
+    
+    logger.info("Загрузка компаний...")
+    if not load_companies():
+        logger.error("Не удалось загрузить компании")
+        return
+    
+    # Создаем приложение
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    
+    # Обработчики команд
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CommandHandler("subscribe", subscribe_cmd))
+    app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
+    app.add_handler(CommandHandler("subscriptions", subscriptions_cmd))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
+    
+    # Health-check
+    async def health(request):
+        return web.Response(text="OK")
+    
+    web_app = web.Application()
+    web_app.router.add_get("/", health)
+    
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Health-check на порту {PORT}")
+    
+    # Запуск
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    logger.info("✅ Бот запущен!")
+    
+    # Держим запущенным
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Остановка...")
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
