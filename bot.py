@@ -9,7 +9,6 @@ from urllib.parse import urljoin
 from typing import List, Dict, Optional, Tuple, Set
 from difflib import SequenceMatcher
 from contextlib import contextmanager
-from functools import lru_cache
 
 from playwright.async_api import async_playwright
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -39,15 +38,15 @@ logger = logging.getLogger(__name__)
 class Config:
     BASE_URL = "https://msfo.valiullin.uk"
     DB_FILE = "reports.db"
-    CHECK_INTERVAL = 3600  # 1 час
+    CHECK_INTERVAL = 3600
     COMPANIES_FILE = "russian_stocks_ids.json"
     MAX_RETRIES = 3
     RETRY_DELAY = 5
     TIMEOUT = 120000
-    CACHE_TTL = 300  # 5 минут кэширования
-    SEARCH_TIMEOUT = 300  # 5 минут на выбор компании
-    MAX_MESSAGE_LENGTH = 4000  # Лимит Telegram
-    RATE_LIMIT_DELAY = (5, 8)  # Задержка между компаниями при проверке
+    CACHE_TTL = 300
+    SEARCH_TIMEOUT = 300
+    MAX_MESSAGE_LENGTH = 4000
+    RATE_LIMIT_DELAY = (5, 8)
     
     TOKEN = os.getenv("BOT_TOKEN")
     PORT = int(os.getenv("PORT", 8080))
@@ -57,9 +56,8 @@ COMPANIES: List[Dict] = []
 BY_TICKER: Dict[str, Dict] = {}
 BY_NAME: Dict[str, Dict] = {}
 
-# Кэш и состояние
 parse_cache: Dict[str, Tuple[float, List[Dict]]] = {}
-search_results: Dict[str, Dict] = {}  # chat_id -> {"companies": [...], "timestamp": time.time()}
+search_results: Dict[str, Dict] = {}
 
 # ==================== ЗАГРУЗКА КОМПАНИЙ ====================
 def load_companies() -> Tuple[List[Dict], Dict[str, Dict], Dict[str, Dict]]:
@@ -82,7 +80,6 @@ def load_companies() -> Tuple[List[Dict], Dict[str, Dict], Dict[str, Dict]]:
                 logger.warning(f"Пропущена некорректная запись: {company}")
                 continue
             
-            # Проверяем обязательные поля
             company_id = company.get('id')
             if not company_id:
                 continue
@@ -127,26 +124,22 @@ def search_companies(query: str) -> List[Dict]:
     results = []
     seen_ids = set()
     
-    # Точное совпадение по тикеру
     if query in BY_TICKER:
         company = BY_TICKER[query]
         results.append(company)
         seen_ids.add(company['id'])
     
-    # Частичное совпадение по тикеру
     for ticker, company in BY_TICKER.items():
         if company['id'] not in seen_ids and query in ticker:
             results.append(company)
             seen_ids.add(company['id'])
     
-    # Поиск по названию
     query_lower = query.lower()
     for name, company in BY_NAME.items():
         if company['id'] not in seen_ids and query_lower in name:
             results.append(company)
             seen_ids.add(company['id'])
     
-    # Сортировка по релевантности
     def relevance(company: Dict) -> float:
         name = company.get("name", "").lower()
         ticker = company.get("ticker", "").lower()
@@ -196,7 +189,6 @@ def init_db():
     with get_db() as conn:
         cursor = conn.cursor()
         
-        # Основная таблица отчетов
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS reports (
                 file_id TEXT,
@@ -212,7 +204,6 @@ def init_db():
             )
         """)
         
-        # Таблица подписок
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
                 chat_id TEXT,
@@ -222,7 +213,6 @@ def init_db():
             )
         """)
         
-        # Таблица пользователей
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 chat_id TEXT PRIMARY KEY,
@@ -232,7 +222,6 @@ def init_db():
             )
         """)
         
-        # Индексы для ускорения запросов
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_reports_company 
             ON reports(company_id)
@@ -389,7 +378,6 @@ async def parse_reports(company_id: int) -> List[Dict]:
         page = await context.new_page()
         
         try:
-            # Попытки загрузить страницу
             for attempt in range(Config.MAX_RETRIES):
                 try:
                     logger.debug(f"Попытка {attempt + 1} загрузить компанию {company_id}")
@@ -423,7 +411,6 @@ async def parse_reports(company_id: int) -> List[Dict]:
                     foundation_date = (await cells[3].inner_text()).strip()
                     publish_date = (await cells[4].inner_text()).strip()
                     
-                    # Фильтруем только бухгалтерские отчеты
                     if "бухгалтер" not in doc_type.lower():
                         continue
                     
@@ -468,14 +455,12 @@ async def parse_reports_cached(company_id: int) -> List[Dict]:
     """Кэширует результаты парсинга"""
     cache_key = f"company_{company_id}"
     
-    # Проверяем кэш
     if cache_key in parse_cache:
         cached_time, cached_data = parse_cache[cache_key]
         if time.time() - cached_time < Config.CACHE_TTL:
             logger.debug(f"Использован кэш для компании {company_id}")
             return cached_data
     
-    # Парсим
     data = await parse_reports(company_id)
     parse_cache[cache_key] = (time.time(), data)
     return data
@@ -488,7 +473,6 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
     
     with get_db() as conn:
         try:
-            # Получаем все уникальные company_id из подписок
             cursor = conn.cursor()
             cursor.execute("SELECT DISTINCT company_id FROM subscriptions")
             company_ids = [row[0] for row in cursor.fetchall()]
@@ -516,24 +500,21 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
                     known_ids = get_known_ids(conn, company_id)
                     new_reports = [r for r in reports if r['file_id'] not in known_ids]
                     
-                    # Обновляем last_seen для всех отчетов
                     all_file_ids = {r['file_id'] for r in reports}
                     update_last_seen(conn, all_file_ids, company_id)
                     
                     if new_reports:
                         save_new_reports(conn, new_reports, company_id)
                         
-                        # Формируем сообщение
                         message = f"🔥 <b>Новые отчёты {format_company_info(company)}</b> ({len(new_reports)}):\n\n"
                         
-                        for j, report in enumerate(new_reports[:20], start=1):  # Ограничиваем до 20
+                        for j, report in enumerate(new_reports[:20], start=1):
                             message += (
                                 f"{j}. <b>{report['period']}</b>\n"
                                 f"   📄 {report['doc_type']}\n"
                                 f"   📅 {report['publish']}\n\n"
                             )
                         
-                        # Создаем кнопки
                         keyboard = []
                         for j, report in enumerate(new_reports[:10], start=1):
                             keyboard.append([
@@ -543,7 +524,6 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
                                 )
                             ])
                         
-                        # Отправляем только подписчикам этой компании
                         subscribers = get_subscribers_for_company(conn, company_id)
                         sent_count = 0
                         
@@ -556,7 +536,7 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
                                     reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
                                 )
                                 sent_count += 1
-                                await asyncio.sleep(0.05)  # Rate limiting для Telegram
+                                await asyncio.sleep(0.05)
                             except Exception as e:
                                 logger.error(f"Не удалось отправить {chat_id}: {e}")
                                 if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
@@ -566,7 +546,6 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
                     else:
                         logger.info(f"Новых отчётов для {company.get('name')} нет")
                     
-                    # Задержка между компаниями
                     if i < len(company_ids) - 1:
                         delay = random.uniform(*Config.RATE_LIMIT_DELAY)
                         await asyncio.sleep(delay)
@@ -578,7 +557,6 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка при проверке: {e}")
     
-    # Очищаем кэш парсера
     parse_cache.clear()
     logger.info("Фоновая проверка завершена")
 
@@ -629,7 +607,6 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверка отчетов конкретной компании"""
     chat_id = str(update.effective_chat.id)
     
-    # Обновляем активность пользователя
     username = update.effective_user.username or update.effective_user.first_name or "unknown"
     with get_db() as conn:
         update_user_activity(conn, chat_id, username)
@@ -653,11 +630,9 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if len(results) == 1:
-        # Одна компания - сразу показываем отчеты
         await show_company_reports(update, context, results[0])
     else:
-        # Несколько компаний - предлагаем выбрать
-        cleanup_search_state()  # Очищаем старые состояния
+        cleanup_search_state()
         
         search_results[chat_id] = {
             "companies": results,
@@ -665,7 +640,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         
         message = f"🔍 <b>Найдено несколько компаний по запросу '{query}':</b>\n\n"
-        for i, company in enumerate(results[:20], 1):  # Ограничиваем до 20
+        for i, company in enumerate(results[:20], 1):
             message += f"{i}. {format_company_info(company)}\n"
         
         if len(results) > 20:
@@ -706,15 +681,12 @@ async def show_company_reports(update: Update, context: ContextTypes.DEFAULT_TYP
         known_ids = get_known_ids(conn, company["id"])
         new_reports = [r for r in reports if r['file_id'] not in known_ids]
         
-        # Обновляем last_seen
         all_file_ids = {r['file_id'] for r in reports}
         update_last_seen(conn, all_file_ids, company["id"])
         
-        # Сохраняем новые
         if new_reports:
             save_new_reports(conn, new_reports, company["id"])
         
-        # Формируем сообщение
         message = f"📊 {format_company_info(company)}\n"
         if new_reports:
             message += f"🔥 Новых: {len(new_reports)}\n\n"
@@ -724,7 +696,7 @@ async def show_company_reports(update: Update, context: ContextTypes.DEFAULT_TYP
         message += f"📚 <b>Всего отчётов: {len(reports)}</b>\n\n"
         
         keyboard = []
-        for i, report in enumerate(reports[:20], start=1):  # Ограничиваем до 20
+        for i, report in enumerate(reports[:20], start=1):
             is_new = "⭐ " if report['file_id'] not in known_ids else ""
             message += (
                 f"{is_new}{i}. <b>{report['period']}</b>\n"
@@ -740,12 +712,9 @@ async def show_company_reports(update: Update, context: ContextTypes.DEFAULT_TYP
                     )
                 ])
         
-        # Удаляем сообщение "Проверяю..."
         await msg.delete()
         
-        # Проверяем длину сообщения
         if len(message) > Config.MAX_MESSAGE_LENGTH:
-            # Разбиваем на части
             parts = []
             current_part = ""
             
@@ -759,11 +728,9 @@ async def show_company_reports(update: Update, context: ContextTypes.DEFAULT_TYP
             if current_part:
                 parts.append(current_part)
             
-            # Отправляем все части кроме последней
             for part in parts[:-1]:
                 await update.message.reply_text(part, parse_mode="HTML")
             
-            # Последнюю часть с кнопками
             await update.message.reply_text(
                 parts[-1],
                 parse_mode="HTML",
@@ -782,10 +749,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     text = update.message.text.strip()
     
-    # Очищаем старые состояния
     cleanup_search_state()
     
-    # Проверяем команду отмены
     if text.lower() in ['/search отмена', 'отмена', 'cancel']:
         if chat_id in search_results:
             del search_results[chat_id]
@@ -794,7 +759,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нет активного поиска для отмены")
         return
     
-    # Проверяем, есть ли активный поиск
     if chat_id in search_results:
         try:
             index = int(text) - 1
@@ -810,10 +774,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         except ValueError:
-            # Не число - очищаем состояние
             del search_results[chat_id]
     
-    # Если это не выбор из списка
     await update.message.reply_text(
         "Используйте команды:\n"
         "/check Компания — посмотреть отчёты\n"
@@ -874,7 +836,6 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     else:
-        # Проверяем, подписан ли уже на кого-то из списка
         with get_db() as conn:
             user_subs = get_user_subscriptions(conn, chat_id)
             already_subscribed = [c for c in results if c["id"] in user_subs]
@@ -903,7 +864,6 @@ async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = str(update.effective_chat.id)
     
     if not context.args:
-        # Показываем все подписки
         with get_db() as conn:
             user_subs = get_user_subscriptions(conn, chat_id)
             
@@ -934,4 +894,64 @@ async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     if not results:
         await update.message.reply_text(
-            f"❌
+            f"❌ Компания '{query}' не найдена\n"
+            "Проверьте название или используйте тикер"
+        )
+        return
+    
+    if len(results) == 1:
+        company = results[0]
+        with get_db() as conn:
+            user_subs = get_user_subscriptions(conn, chat_id)
+            
+            if company["id"] not in user_subs:
+                await update.message.reply_text(
+                    f"❌ Вы не подписаны на {format_company_info(company)}",
+                    parse_mode="HTML"
+                )
+                return
+            
+            unsubscribe_user_from_company(conn, chat_id, company["id"])
+        
+        ticker = company.get('ticker', '')
+        sub_hint = f" /subscribe {ticker}" if ticker else ""
+        
+        await update.message.reply_text(
+            f"❌ Отписка от {format_company_info(company)}\n"
+            f"Вы больше не будете получать уведомления.{sub_hint}",
+            parse_mode="HTML"
+        )
+    else:
+        with get_db() as conn:
+            user_subs = get_user_subscriptions(conn, chat_id)
+            subscribed_results = [c for c in results if c["id"] in user_subs]
+            
+            if not subscribed_results:
+                await update.message.reply_text(
+                    f"❌ Вы не подписаны на компании по запросу '{query}'"
+                )
+                return
+            
+            if len(subscribed_results) == 1:
+                company = subscribed_results[0]
+                unsubscribe_user_from_company(conn, chat_id, company["id"])
+                
+                ticker = company.get('ticker', '')
+                sub_hint = f" /subscribe {ticker}" if ticker else ""
+                
+                await update.message.reply_text(
+                    f"❌ Отписка от {format_company_info(company)}\n"
+                    f"Вы больше не будете получать уведомления.{sub_hint}",
+                    parse_mode="HTML"
+                )
+            else:
+                message = f"🔍 <b>Вы подписаны на несколько компаний из списка:</b>\n\n"
+                for i, company in enumerate(subscribed_results[:20], 1):
+                    ticker = company.get('ticker', '')
+                    message += f"{i}. {format_company_info(company)}\n"
+                    if ticker:
+                        message += f"   /unsubscribe {ticker}\n"
+                    else:
+                        message += f"   /unsubscribe {company['name']}\n"
+                
+               
