@@ -41,11 +41,10 @@ COMPANIES = []
 BY_TICKER = {}
 BY_NAME = {}
 
-# Хранилище в памяти
-known_reports = defaultdict(set)  # company_id -> {file_ids}
-subscriptions = defaultdict(set)  # chat_id -> {company_ids}
-parse_cache = {}  # company_id -> (timestamp, data)
-search_results = {}  # chat_id -> {companies, timestamp}
+known_reports = defaultdict(set)
+subscriptions = defaultdict(set)
+parse_cache = {}
+search_results = {}
 
 # ==================== ЗАГРУЗКА КОМПАНИЙ ====================
 def load_companies():
@@ -90,25 +89,21 @@ def search_companies(query):
     results = []
     seen = set()
     
-    # Точное совпадение по тикеру
     if query_upper in BY_TICKER:
         c = BY_TICKER[query_upper]
         results.append(c)
         seen.add(c['id'])
     
-    # Частичное по тикеру
     for ticker, c in BY_TICKER.items():
         if c['id'] not in seen and query_upper in ticker:
             results.append(c)
             seen.add(c['id'])
     
-    # Частичное по названию
     for name, c in BY_NAME.items():
         if c['id'] not in seen and query_lower in name:
             results.append(c)
             seen.add(c['id'])
     
-    # Сортировка по релевантности
     results.sort(key=lambda c: SequenceMatcher(None, query_lower, c['name'].lower()).ratio(), reverse=True)
     return results[:20]
 
@@ -126,36 +121,103 @@ def format_company(c):
     return f"<b>{name}</b> ({ticker})" if ticker else f"<b>{name}</b>"
 
 
-# ==================== ПАРСЕР ====================
+# ==================== ПАРСЕР (ИСПРАВЛЕННЫЙ) ====================
 async def parse_reports(company_id):
     url = f"https://www.e-disclosure.ru/portal/files.aspx?id={company_id}&type=3"
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox']
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu'
+            ]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
-            locale="ru-RU"
+            locale="ru-RU",
+            timezone_id="Europe/Moscow"
         )
         page = await context.new_page()
         
         try:
-            # 3 попытки загрузки
+            logger.info(f"Загружаем компанию {company_id}...")
+            
+            # Пробуем загрузить с разными стратегиями
             for attempt in range(3):
                 try:
-                    await page.goto(url, wait_until="networkidle", timeout=120000)
-                    await page.wait_for_timeout(5000)
-                    await page.wait_for_selector("table tbody tr", timeout=30000)
-                    break
+                    if attempt == 0:
+                        # Первая попытка - обычная загрузка
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    elif attempt == 1:
+                        # Вторая попытка - ждем загрузки сети
+                        await page.goto(url, wait_until="networkidle", timeout=60000)
+                    else:
+                        # Третья попытка - просто ждем
+                        await page.goto(url, wait_until="load", timeout=60000)
+                    
+                    # Ждем подольше
+                    await asyncio.sleep(10)
+                    
+                    # Проверяем, что страница загрузилась
+                    title = await page.title()
+                    logger.info(f"Заголовок страницы: {title}")
+                    
+                    # Пробуем найти таблицу разными селекторами
+                    selectors = [
+                        "table tbody tr",
+                        "table tr",
+                        ".table tbody tr",
+                        "#ctl00_ContentPlaceHolder1_gvData tr",
+                        "table[id*='gv'] tr",
+                        "table[class*='table'] tr"
+                    ]
+                    
+                    table_found = False
+                    for selector in selectors:
+                        try:
+                            await page.wait_for_selector(selector, timeout=10000)
+                            logger.info(f"Таблица найдена по селектору: {selector}")
+                            table_found = True
+                            break
+                        except Exception:
+                            continue
+                    
+                    if table_found:
+                        break
+                    else:
+                        # Делаем скриншот для отладки
+                        await page.screenshot(path=f"/tmp/debug_{company_id}.png")
+                        logger.warning(f"Таблица не найдена, попытка {attempt + 1}")
+                        
                 except Exception as e:
+                    logger.warning(f"Попытка {attempt + 1}: {e}")
                     if attempt == 2:
+                        await page.screenshot(path=f"/tmp/error_{company_id}.png")
                         raise
                     await asyncio.sleep(5)
             
-            rows = await page.locator("table tbody tr").all()
+            # Ищем строки таблицы
+            rows = []
+            for selector in selectors:
+                try:
+                    rows = await page.locator(selector).all()
+                    if rows:
+                        break
+                except Exception:
+                    continue
+            
+            if not rows:
+                logger.warning(f"Строки таблицы не найдены для компании {company_id}")
+                # Пробуем получить весь HTML для анализа
+                html = await page.content()
+                logger.debug(f"HTML страницы (первые 1000 символов): {html[:1000]}")
+                return []
+            
+            logger.info(f"Найдено строк: {len(rows)}")
             reports = []
             
             for row in rows:
@@ -170,24 +232,51 @@ async def parse_reports(company_id):
                     
                     link = cells[5].locator("a")
                     if await link.count() == 0:
-                        continue
+                        # Может быть в другой ячейке
+                        for i in range(len(cells)):
+                            link = cells[i].locator("a")
+                            if await link.count() > 0:
+                                break
+                        else:
+                            continue
                     
                     href = await link.first.get_attribute("href")
-                    if not href or "Fileid=" not in href:
+                    if not href:
+                        continue
+                    
+                    # Пробуем разные способы получить ID файла
+                    file_id = None
+                    if "Fileid=" in href:
+                        file_id = href.split("Fileid=")[1].split("&")[0]
+                    elif "fileid=" in href.lower():
+                        file_id = href.lower().split("fileid=")[1].split("&")[0]
+                    elif "/file/" in href:
+                        file_id = href.split("/file/")[1].split("/")[0]
+                    
+                    if not file_id:
                         continue
                     
                     reports.append({
                         "period": (await cells[2].inner_text()).strip(),
                         "doc_type": doc_type,
                         "publish": (await cells[4].inner_text()).strip(),
-                        "file_id": href.split("Fileid=")[1]
+                        "file_id": file_id
                     })
-                except Exception:
+                    
+                except Exception as e:
+                    logger.debug(f"Ошибка парсинга строки: {e}")
                     continue
             
             logger.info(f"Компания {company_id}: найдено {len(reports)} отчетов")
             return reports
             
+        except Exception as e:
+            logger.error(f"Ошибка парсинга компании {company_id}: {e}")
+            try:
+                await page.screenshot(path=f"/tmp/final_error_{company_id}.png")
+            except Exception:
+                pass
+            return []
         finally:
             await context.close()
             await browser.close()
@@ -197,11 +286,12 @@ async def parse_reports_cached(company_id):
     now = time.time()
     if company_id in parse_cache:
         cached_time, data = parse_cache[company_id]
-        if now - cached_time < 300:  # 5 минут
+        if now - cached_time < 300:
             return data
     
     data = await parse_reports(company_id)
-    parse_cache[company_id] = (now, data)
+    if data:  # Кэшируем только если есть данные
+        parse_cache[company_id] = (now, data)
     return data
 
 
@@ -209,7 +299,6 @@ async def parse_reports_cached(company_id):
 async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Фоновая проверка...")
     
-    # Собираем уникальные company_id
     company_ids = set()
     for comps in subscriptions.values():
         company_ids.update(comps)
@@ -227,21 +316,17 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
             if not reports:
                 continue
             
-            # Ищем новые
             known = known_reports.get(company_id, set())
             new_reports = [r for r in reports if r['file_id'] not in known]
             
-            # Обновляем известные
             for r in reports:
                 known_reports[company_id].add(r['file_id'])
             
             if new_reports:
-                # Формируем сообщение
                 msg = f"🔥 <b>Новые отчёты {format_company(company)}</b> ({len(new_reports)}):\n\n"
                 for i, r in enumerate(new_reports[:10], 1):
                     msg += f"{i}. <b>{r['period']}</b>\n   📄 {r['doc_type']}\n   📅 {r['publish']}\n\n"
                 
-                # Кнопки
                 keyboard = []
                 for r in new_reports[:5]:
                     keyboard.append([InlineKeyboardButton(
@@ -249,7 +334,6 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE):
                         callback_data=f"open_{r['file_id']}"
                     )])
                 
-                # Отправляем подписчикам
                 subscribers = [cid for cid, comps in subscriptions.items() if company_id in comps]
                 for chat_id in subscribers:
                     try:
@@ -337,11 +421,11 @@ async def show_reports(update: Update, company):
     try:
         reports = await parse_reports_cached(company['id'])
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка загрузки: {e}")
+        await msg.edit_text(f"❌ Ошибка загрузки: {str(e)[:100]}", parse_mode="HTML")
         return
     
     if not reports:
-        await msg.edit_text(f"📊 {format_company(company)}\n❌ Отчёты не найдены", parse_mode="HTML")
+        await msg.edit_text(f"📊 {format_company(company)}\n❌ Отчёты не найдены или сайт недоступен", parse_mode="HTML")
         return
     
     known = known_reports.get(company['id'], set())
@@ -369,7 +453,6 @@ async def show_reports(update: Update, company):
     
     await msg.delete()
     
-    # Разбиваем длинные сообщения
     if len(text) > 4000:
         for part in [text[i:i+4000] for i in range(0, len(text), 4000)]:
             await update.message.reply_text(part, parse_mode="HTML")
@@ -385,7 +468,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     text = update.message.text.strip()
     
-    # Очистка старых поисков
     now = time.time()
     expired = [cid for cid, data in search_results.items() if now - data['timestamp'] > 300]
     for cid in expired:
@@ -528,7 +610,6 @@ async def subscriptions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="HTML")
 
 
-# ==================== ОБРАБОТКА ОШИБОК ====================
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Ошибка: {context.error}")
     if update and update.effective_message:
@@ -538,7 +619,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# ==================== ЗАПУСК ====================
 async def post_init(app: Application):
     app.job_queue.run_repeating(check_and_notify, interval=CHECK_INTERVAL, first=10)
     logger.info("Фоновая проверка запущена")
@@ -554,10 +634,8 @@ async def main():
         logger.error("Не удалось загрузить компании")
         return
     
-    # Создаем приложение
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
-    # Обработчики команд
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("check", check_cmd))
@@ -568,7 +646,6 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
     
-    # Health-check
     async def health(request):
         return web.Response(text="OK")
     
@@ -581,13 +658,11 @@ async def main():
     await site.start()
     logger.info(f"Health-check на порту {PORT}")
     
-    # Запуск
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
     logger.info("✅ Бот запущен!")
     
-    # Держим запущенным
     try:
         while True:
             await asyncio.sleep(3600)
